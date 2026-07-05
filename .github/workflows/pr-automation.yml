@@ -1,0 +1,323 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          set -o pipefail
+          npm run lint -- -f json > eslint-results.json 2>&1 || true
+          ISSUE_COUNT=$(jq 'length' eslint-results.json 2>/dev/null || echo 0)
+          echo "STATUS=$([ "$ISSUE_COUNT" -gt 0 ] && echo FAIL || echo PASS)" >> "$GITHUB_OUTPUT"
+          echo "ISSUE_COUNT=$ISSUE_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Run Prettier formatting check
+        id: prettier
+        run: |
+          npm run prettier -- --check . > prettier-results.txt 2>&1 || true
+          echo "STATUS=$([ $? -eq 0 ] && echo PASS || echo FAIL)" >> "$GITHUB_OUTPUT"
+
+      - name: Post Code Quality Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eslintStatus = '${{ steps.eslint.outputs.STATUS }}';
+            const eslintIssueCount = '${{ steps.eslint.outputs.ISSUE_COUNT }}';
+            const prettierStatus = '${{ steps.prettier.outputs.STATUS }}';
+            
+            let body = '## Code Quality Report\n\n';
+            body += `### ESLint: ${eslintStatus === 'PASS' ? '✅ Passed' : '❌ Failed'}\n`;
+            if (eslintStatus === 'FAIL') {
+              body += `Found ${eslintIssueCount} linting issues:\n`;
+              try {
+                const issues = JSON.parse(require('fs').readFileSync('eslint-results.json', 'utf8'));
+                issues.slice(0, 10).forEach(issue => {
+                  const filePath = issue.filePath.replace(`${process.env.GITHUB_WORKSPACE}/`, '');
+                  body += `- \`${filePath}:${issue.line}\`: ${issue.message} (${issue.ruleId})\n`;
+                });
+                if (issues.length > 10) {
+                  body += `- ... and ${issues.length - 10} additional issues\n`;
+                }
+              } catch (e) {
+                body += 'Could not parse ESLint results, check workflow logs for details.\n';
+              }
+            }
+            
+            body += `\n### Prettier: ${prettierStatus === 'PASS' ? '✅ Passed' : '❌ Failed'}\n`;
+            if (prettierStatus === 'FAIL') {
+              const prettierLog = require('fs').readFileSync('prettier-results.txt', 'utf8');
+              body += 'Formatting issues detected in the following files:\n```\n';
+              body += prettierLog.split('\n').filter(l => l.trim()).join('\n');
+              body += '\n```\nRun `npm run prettier -- --write .` to fix formatting issues.\n';
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+            if (eslintStatus === 'FAIL' || prettierStatus === 'FAIL') {
+              core.setFailed('Code quality checks failed.');
+            }
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run test suite with coverage
+        id: tests
+        run: |
+          npm test -- --coverage 2>&1 || true
+          echo "STATUS=$([ $? -eq 0 ] && echo PASS || echo FAIL)" >> "$GITHUB_OUTPUT"
+          if [ -f coverage/coverage-summary.json ]; then
+            echo "STATEMENTS=$(jq -r '.total.statements.pct' coverage/coverage-summary.json)" >> "$GITHUB_OUTPUT"
+            echo "BRANCHES=$(jq -r '.total.branches.pct' coverage/coverage-summary.json)" >> "$GITHUB_OUTPUT"
+            echo "FUNCTIONS=$(jq -r '.total.functions.pct' coverage/coverage-summary.json)" >> "$GITHUB_OUTPUT"
+            echo "LINES=$(jq -r '.total.lines.pct' coverage/coverage-summary.json)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-coverage-reports
+          path: coverage/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Post Test Coverage Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const testStatus = '${{ steps.tests.outputs.STATUS }}';
+            const statements = '${{ steps.tests.outputs.STATEMENTS }}' || 'N/A';
+            const branches = '${{ steps.tests.outputs.BRANCHES }}' || 'N/A';
+            const functions = '${{ steps.tests.outputs.FUNCTIONS }}' || 'N/A';
+            const lines = '${{ steps.tests.outputs.LINES }}' || 'N/A';
+
+            let body = '## Test Coverage Report\n\n';
+            body += `### Test Suite: ${testStatus === 'PASS' ? '✅ All tests passed' : '❌ Tests failed'}\n\n`;
+            body += '### Coverage Summary:\n';
+            body += `- Statements: ${statements}%\n`;
+            body += `- Branches: ${branches}%\n`;
+            body += `- Functions: ${functions}%\n`;
+            body += `- Lines: ${lines}%\n\n`;
+            body += 'Full coverage reports are attached as workflow artifacts.';
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+            if (testStatus === 'FAIL') {
+              core.setFailed('Test suite failed.');
+            }
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run dependency vulnerability scan
+        id: npm-audit
+        run: |
+          npm audit --json > npm-audit-results.json 2>&1 || true
+          TOTAL_VULNS=$(jq -r '.metadata.vulnerabilities.total // 0' npm-audit-results.json)
+          echo "STATUS=$([ "$TOTAL_VULNS" -eq 0 ] && echo PASS || echo FAIL)" >> "$GITHUB_OUTPUT"
+          echo "TOTAL=$TOTAL_VULNS" >> "$GITHUB_OUTPUT"
+          echo "CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' npm-audit-results.json)" >> "$GITHUB_OUTPUT"
+          echo "HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' npm-audit-results.json)" >> "$GITHUB_OUTPUT"
+          echo "MODERATE=$(jq -r '.metadata.vulnerabilities.moderate // 0' npm-audit-results.json)" >> "$GITHUB_OUTPUT"
+          echo "LOW=$(jq -r '.metadata.vulnerabilities.low // 0' npm-audit-results.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Scan for secrets in PR changes
+        id: secret-scan
+        uses: trufflesecurity/trufflehog@v3
+        with:
+          path: ./
+          base: ${{ github.event.pull_request.base.sha }}
+          head: ${{ github.event.pull_request.head.sha }}
+          extra_args: --only-verified
+
+      - name: Post Security Scan Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const auditStatus = '${{ steps.npm-audit.outputs.STATUS }}';
+            const totalVulns = '${{ steps.npm-audit.outputs.TOTAL }}';
+            const critical = '${{ steps.npm-audit.outputs.CRITICAL }}';
+            const high = '${{ steps.npm-audit.outputs.HIGH }}';
+            const moderate = '${{ steps.npm-audit.outputs.MODERATE }}';
+            const low = '${{ steps.npm-audit.outputs.LOW }}';
+            const secretStatus = '${{ steps.secret-scan.outcome }}' === 'success' ? 'PASS' : 'FAIL';
+
+            let body = '## Security Scan Report\n\n';
+            body += `### Dependencies: ${auditStatus === 'PASS' ? '✅ No known vulnerabilities detected' : '❌ Vulnerabilities found'}\n`;
+            if (auditStatus === 'FAIL') {
+              body += `Total ${totalVulns} vulnerabilities found in Dependencies:\n`;
+              body += `- Critical: ${critical}\n`;
+              body += `- High: ${high}\n`;
+              body += `- Moderate: ${moderate}\n`;
+              body += `- Low: ${low}\n`;
+              body += 'Run `npm audit fix` to resolve automatically fixable issues, and review remaining vulnerabilities.\n';
+            }
+
+            body += `\n### Secret Scanning: ${secretStatus === 'PASS' ? '✅ No verified secrets detected' : '❌ Verified secrets found in code changes'}\n`;
+            if (secretStatus === 'FAIL') {
+              body += 'Verified credentials or secrets were found in this pull request. Remove these immediately and rotate any exposed tokens/keys.';
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+            if (auditStatus === 'FAIL' || secretStatus === 'FAIL') {
+              core.setFailed('Security scans detected issues requiring attention.');
+            }
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        id: build
+        run: |
+          npm run build > build-output.log 2>&1 || BUILD_FAILED=1
+          echo "STATUS=${BUILD_FAILED:-PASS}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate application endpoints
+        id: endpoint-validation
+        if: steps.build.outputs.STATUS == 'PASS'
+        run: |
+          # Start built application in background
+          timeout 30 npm start &
+          APP_PID=$!
+          # Wait for application to initialize
+          sleep 15
+          # Check if root endpoint responds
+          if curl --retry 3 --retry-delay 2 -f http://localhost:3000/ > /dev/null 2>&1; then
+            echo "STATUS=PASS" >> "$GITHUB_OUTPUT"
+          else
+            echo "STATUS=FAIL" >> "$GITHUB_OUTPUT"
+            kill $APP_PID 2>/dev/null || true
+            exit 1
+          fi
+          # Clean up background process
+          kill $APP_PID 2>/dev/null || true
+
+      - name: Upload deployment preview artifacts
+        if: steps.build.outputs.STATUS == 'PASS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: |
+            dist/
+            build/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Post Build Validation Report
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const buildStatus = '${{ steps.build.outputs.STATUS }}' || 'FAIL';
+            const endpointStatus = '${{ steps.endpoint-validation.outputs.STATUS }}' || (buildStatus === 'PASS' ? 'SKIPPED' : 'N/A');
+            
+            let body = '## Build Validation\n\n';
+            body += `- Application Build: ${buildStatus === 'PASS' ? '✅ Build completed successfully' : '❌ Build failed'}\n`;
+            if (buildStatus === 'FAIL') {
+              const buildLog = require('fs').readFileSync('build-output.log', 'utf8');
+              body += 'Build error output (last 1500 characters):\n```\n';
+              body += buildLog.slice(-1500);
+              body += '\n```\n';
+            } else {
+              const endpointText = endpointStatus === 'PASS' 
+                ? '✅ Application endpoints are accessible' 
+                : endpointStatus === 'FAIL' 
+                  ? '❌ Application endpoints did not respond as expected'
+                  : '⏭️ Endpoint validation skipped';
+              body += `- Endpoint Check: ${endpointText}\n`;
+              body += 'Deployment preview artifacts (build output) are available as workflow attachments.';
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+            if (buildStatus === 'FAIL' || endpointStatus === 'FAIL') {
+              core.setFailed('Build validation failed.');
+            }
